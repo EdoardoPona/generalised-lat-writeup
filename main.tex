@@ -1,0 +1,373 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper, margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{parskip}
+\usepackage[colorlinks=true, linkcolor=black, citecolor=blue!50!black, urlcolor=blue!50!black]{hyperref}
+\usepackage[round]{natbib}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{microtype}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+\emergencystretch=2em
+
+% Notation shortcuts
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\hh}{\hat h}
+\newcommand{\vv}{\hat v}
+\newcommand{\thmax}{\theta_{\max}}
+\newcommand{\eps}{\varepsilon}
+\newcommand{\norm}[1]{\left\lVert#1\right\rVert}
+\newcommand{\inner}[2]{\langle #1, #2 \rangle}
+
+\title{Angular Latent Adversarial Training}
+\author{Edoardo Pona}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section*{Summary}
+
+Latent adversarial training \citep[LAT,][]{casper2024lat} fine-tunes a model under worst-case latent perturbations bounded by an $L_2$ ball. We argue this is the wrong geometry for transformer latents. Under the linear representation hypothesis, concepts are encoded as directions in the residual stream and the standard way to compare two representations is the cosine of the angle between them, not their $L_2$ distance. We therefore replace the $L_2$ constraint with an \emph{angular} (norm-preserving) one, parameterised as a per-token rotation of the activation by at most $\thmax$ radians, and integrate it into Casper et al.'s released PGD trainer with minimal surgery.
+
+A preliminary single-budget experiment on the trojan-removal task from \citet{casper2024lat} confirms that the angular code path produces sensible learning dynamics and a Pareto-shaped trajectory along the safety/capability frontier. At the matched-effort budgets we tested, $L_2$ ($\eps=8$) and angular ($\thmax=0.20$\,rad) trade off along different parts of the frontier rather than one dominating the other: a budget sweep is the natural next experiment.
+
+\section{Motivation}
+
+Casper et al.\ \citep{casper2024lat} formulate LAT as the saddle-point problem
+\begin{equation}
+\min_\theta \sum_i \max_{\norm{\delta_i^\ell}_p \le \eps}\; \mathcal{L}\big(g_{\theta_2}(f_{\theta_1}(x_i) + \delta_i^\ell),\, y_i\big),
+\label{eq:lat}
+\end{equation}
+where $f_{\theta_1}$ produces a latent activation $\ell_i = f_{\theta_1}(x_i)$ at some chosen depth and $g_{\theta_2}$ maps the (perturbed) latent to the output. The inner $\max$ is solved by projected gradient descent (PGD) on $\delta$; the outer $\min$ is ordinary supervised fine-tuning. Casper et al.\ choose $L_p = L_2$ throughout.
+
+\paragraph{Concepts are directions.} The linear representation hypothesis \citep[LRH;][]{mikolov2013distributed, park2023linear} states that high-level concepts (sentiment, refusal, an entity's identity, factual claims) are encoded as approximately linear directions in a model's residual stream; recent theory traces this linearity to the softmax cross-entropy objective combined with the implicit bias of gradient descent \citep{jiang2024origins}. Linear probes recover concepts by fitting a single direction \citep{burns2022discovering, marks2023geometry}; activation steering shifts behaviour by adding a concept direction to the residual stream \citep{turner2023activation, zou2023representation}. The operative distance between representations is correspondingly cosine similarity, that is, the cosine of the angle between them, not $L_2$. The architecture reinforces this: RMSNorm/LayerNorm absorbs magnitude before each sublayer, and attention scores are inner products on (effectively) unit queries and keys. The right notion of ``smallest change of meaning'' is therefore a small angle, and the LAT adversary, whose role is to perturb meaning, ought to be budgeted in angular rather than Euclidean units. Concretely, we replace the $L_2$ constraint by a per-token angular cap of half-angle $\thmax$, the first variant in a broader programme of \emph{generalised} LAT (rotation-plus-rescale and per-head variants for QKV are documented as future work).
+
+\section{Method}
+
+\subsection{Notation and threat model}
+
+For one token (or one attention head's slice for QKV) write $h \in \R^d$, with $d$ the residual hidden dimension or the per-head dimension respectively. The perturbed activation is $h' = h + \delta$. The angle is
+\begin{equation}
+\angle(h, h') \;=\; \arccos\!\left(\frac{\inner{h}{h'}}{\norm{h}\,\norm{h'}}\right).
+\end{equation}
+
+The threat model is, exactly as in \citet{casper2024lat}, a training-time tool rather than a literal deployment-time attacker: there is no white-box latent-space adversary in production. The point is to make the model robust to distribution shifts (trojans, jailbreaks, novel attacks) the developer cannot enumerate ahead of time. We replace the $L_2$ ball by the per-token spherical cap
+\begin{equation}
+\mathcal{B}_{\thmax}(h) \;=\; \{ h' \in \R^d : \angle(h, h') \le \thmax,\; \norm{h'} = \norm{h} \},
+\end{equation}
+parameterised in radians.
+
+\subsection{Norm-preserving rotation}
+
+We parameterise the perturbed activation as a rotation of $h$ in the 2D plane spanned by $h$ and a unit tangent direction $\vv$, by angle $\alpha \in [0, \thmax]$:
+\begin{equation}
+h' \;=\; \cos\alpha \cdot h \;+\; \sin\alpha \cdot \norm{h}\,\vv,
+\qquad \vv \in \R^d,\ \vv \perp h,\ \norm{\vv} = 1,\ \alpha \in [0, \thmax].
+\label{eq:rotation}
+\end{equation}
+
+A rotation in $\R^d$ with $d > 2$ is not specified by an angle alone; one also has to pick the 2D plane in which the rotation happens. Here that plane is fixed to contain $h$, but its second axis $\vv$ has $d-1$ degrees of freedom: any unit vector in the orthogonal complement of $h$. Geometrically, $\vv$ picks the rotation plane and $\alpha$ picks the angle within that plane; together $(\alpha, \vv)$ are coordinates on the spherical cap $\mathcal{B}_{\thmax}(h)$, with $\alpha \in [0, \thmax]$ and $\vv$ ranging over the unit tangent sphere $S^{d-2}$ at $h$. This parameterisation preserves $\norm{h'} = \norm{h}$ exactly and gives $\angle(h, h') = \alpha$ exactly.
+
+The LAT adversary's job is to pick the pair $(\alpha, \vv)$ that maximises the outer loss. We do not parameterise $(\alpha, \vv)$ explicitly during optimisation: we run gradient ascent on the additive perturbation $\delta = h' - h$ in the ambient $\R^d$, and at each step the projection of \S\ref{sec:projection} reads $\vv$ off as the (normalised) component of $h+\delta$ perpendicular to $h$, then clips $\alpha \le \thmax$. So whichever direction the gradient happens to tilt $\delta$ along becomes $\vv$ for the next iteration; the algorithm never enumerates plane choices.
+
+\subsection{Projection onto the spherical cap}\label{sec:projection}
+
+For an arbitrary additive perturbation $\delta$, we need a projection $\Pi_{\mathcal{B}_{\thmax}}(h + \delta)$ that returns the closest point in $\mathcal{B}_{\thmax}(h)$. The closed-form decomposition runs as follows. Write $\hh = h / \norm{h}$ and decompose $h+\delta$ into components parallel and perpendicular to $\hh$:
+\begin{align}
+(h + \delta)_\parallel &= \inner{\hh}{h+\delta}\,\hh, &
+(h + \delta)_\perp &= (h+\delta) - (h+\delta)_\parallel.
+\end{align}
+The current angle is $\alpha = \mathrm{atan2}\big(\norm{(h+\delta)_\perp},\, \inner{\hh}{h+\delta}\big)$, valued in $[0, \pi]$. We clip
+\begin{equation}
+\alpha' \;=\; \min(\alpha,\, \thmax),
+\end{equation}
+take the unit tangent direction $\vv = (h+\delta)_\perp / \norm{(h+\delta)_\perp}$, and reconstruct
+\begin{equation}
+h'_{\text{proj}} \;=\; \norm{h}\,\big(\cos\alpha' \cdot \hh \;+\; \sin\alpha' \cdot \vv\big),
+\qquad
+\delta_{\text{proj}} \;=\; h'_{\text{proj}} - h.
+\label{eq:proj}
+\end{equation}
+
+Two edge cases need care:
+
+\begin{itemize}[leftmargin=*]
+\item \textbf{Degenerate perpendicular component.} If $\norm{(h+\delta)_\perp} < \tau$ for a small $\tau$, $\vv$ is ill-defined. We sample $\vv$ from a unit Gaussian projected onto the tangent space at $\hh$; in practice this branch is rarely taken because residual-stream activations of a trained Llama-2 are generic.
+\item \textbf{Zero-norm token.} If $\norm{h} < \tau$, the angle is ill-defined. We zero the perturbation for those tokens. Empirically this also rarely fires.
+\end{itemize}
+
+The full projection is $O(d)$ per token and runs per-token (or per-token-per-head for QKV) under a single batched PyTorch implementation.
+
+\subsection{Random initialisation in the cap}
+
+Following \citet{casper2024lat}, we initialise $\delta_0$ to a random point in the cap rather than at zero. We draw $\alpha_0 \sim U[0, \thmax]$ and $\vv \in \R^d$ uniformly on the unit tangent sphere at $h$, then set $h_0 = \norm{h}(\cos\alpha_0\,\hh + \sin\alpha_0\,\vv)$ and $\delta_0 = h_0 - h$. This matches Casper's $L_2$ init (random direction times uniform magnitude) in spirit.
+
+\section{Implementation}
+
+\subsection{Casper et al.'s PGD inner loop}
+
+The existing $L_2$ inner loop of \citet{casper2024lat} runs $K$ steps:
+
+\begin{enumerate}[leftmargin=*]
+\item Forward with $\delta=0$ in evaluation mode to cache the unperturbed latent $h$ and the per-batch $(\min h, \max h)$ used for activation clipping.
+\item Initialise $\delta_0$ either at zero or uniformly random in the $L_2$ ball of radius $\eps$.
+\item For $k = 0, \dots, K-1$: forward with $h + \delta_k$, backward through $\delta$, take a fixed-size step
+$\delta_{k+1} \leftarrow \delta_k + \alpha\, \nabla_\delta \mathcal{L} / \norm{\nabla_\delta \mathcal{L}}_2$ with $\alpha = \eps/K$, then project (rescale to the ball if outside, then activation-clip $h+\delta_{k+1}$ to $[\min h, \max h]$).
+\item Return $\delta^\star$ detached and run one outer SFT step.
+\end{enumerate}
+
+Two implementation details deviate from textbook PGD: the gradient is L2-normalised per batch element rather than signed, and the L2 norm in the projection is taken over all non-batch dimensions at once, so a single $\eps$ budget is shared across the whole sequence (and across heads, for QKV). We inherit both choices unchanged.
+
+\subsection{Angular inner loop}
+
+The threat model in \S2 is naturally expressed in rotation parameters $(\alpha, \vv)$, but the inner loop optimises the additive perturbation $\delta$ directly, exactly as in the $L_2$ path of \citet{casper2024lat}. \footnote{This was done for implementation simplicity, but we will be exploring Riemannian SGD-style optimisation shortly, see Appendix~\ref{app:riemannian}.}
+The rotation parameters are \emph{read off} the current iterate $h+\delta$ by the projection at every step: the perpendicular component of $h+\delta$ relative to $\hh$ defines $\vv$ (after normalisation), and the corresponding angle is given by $\mathrm{atan2}$. Whichever tangent direction the gradient happens to push $\delta$ in becomes $\vv$ for the next step; the projection clips the implied angle to $\thmax$ if it overshoots.
+
+Concretely, after backprop yields the per-token unit gradient $g_k$ over the last dimension, we take a tangent step
+\begin{equation}
+\delta_{k+1} \;\leftarrow\; \delta_k \;+\; \sin(\thmax/K)\,\norm{h}\,g_k,
+\label{eq:angular-step}
+\end{equation}
+where the scaling $\sin(\thmax/K)\,\norm{h}$ is the tangent component of an exact rotation by $\thmax/K$ radians: by equation~(\ref{eq:rotation}), rotating $h$ by an angle $\alpha$ in direction $g_k$ gives $h' = \cos\alpha\,h + \sin\alpha\,\norm{h}\,g_k$, so the displacement $h' - h$ is a parallel correction $(\cos\alpha-1)h$ plus a tangent step $\sin\alpha\,\norm{h}\,g_k$. We take only the tangent step; the parallel correction is $O((\thmax/K)^2)$ and is absorbed by the projection. See Appendix ~\ref{app:step-derivation} for more details on the derivation. The projection of equation~(\ref{eq:proj}) then extracts the actual $(\alpha, \vv)$ from $h+\delta_{k+1}$, clips $\alpha \le \thmax$, and rebuilds the iterate on the sphere of radius $\norm{h}$. Optimising $\delta$ rather than parameterising $(\alpha, \vv)$ directly keeps the inner loop structurally identical to Casper's $L_2$ path: both methods step in some direction in latent space and project; only the constraint set differs. Algorithm~\ref{alg:angular-pgd} states the full inner loop.
+
+\begin{algorithm}[h]
+\caption{Angular PGD inner loop. Last dim is the per-token (or per-head, for QKV) inner-product axis; all per-token quantities are computed and broadcast along that axis.}
+\label{alg:angular-pgd}
+\begin{algorithmic}[1]
+\Require unperturbed latent $h$, half-angle $\thmax$, PGD steps $K$, loss $\mathcal{L}$
+\Ensure detached perturbation $\delta^\star$ with $h+\delta^\star \in \mathcal{B}_{\thmax}(h)$
+\State $\hh \gets h / \norm{h}$ \Comment{per-token unit vector}
+\State \textit{Random init:}
+\State \quad $v \sim \mathcal{N}(0, I)$;\; $v \gets v - \inner{\hh}{v}\,\hh$;\; $\vv \gets v / \norm{v}$ \Comment{uniform on tangent unit sphere}
+\State \quad $\alpha_0 \sim U[0, \thmax]$ \Comment{per token, independently}
+\State \quad $\delta \gets \norm{h}\,(\cos\alpha_0\,\hh + \sin\alpha_0\,\vv) - h$
+\For{$k = 0, \dots, K{-}1$}
+    \State $\mathcal{L}_k \gets \mathcal{L}\big(g_{\theta_2}(h+\delta),\, y\big)$ \Comment{forward through perturbed model}
+    \State $g \gets \nabla_\delta \mathcal{L}_k$ \Comment{retain autograd graph for next iteration}
+    \State $g \gets g / \norm{g}$ \Comment{per-token $L_2$ normalisation}
+    \State $\delta \gets \delta + \sin(\thmax/K)\,\norm{h}\,g$ \Comment{tangent-$L_2$ step}
+    \State \textit{Project onto $\mathcal{B}_{\thmax}(h)$:}
+    \State \quad $p \gets \inner{\hh}{h+\delta}$;\; $r \gets (h+\delta) - p\,\hh$
+    \State \quad $\alpha \gets \mathrm{atan2}(\norm{r},\,p)$;\; $\alpha' \gets \min(\alpha, \thmax)$
+    \State \quad $\vv \gets r / \norm{r}$ \Comment{resample random tangent if $\norm{r} < \tau$}
+    \State \quad $\delta \gets \norm{h}\,(\cos\alpha'\,\hh + \sin\alpha'\,\vv) - h$;\; \textsc{detach}
+\EndFor
+\State \Return $\delta$
+\end{algorithmic}
+\end{algorithm}
+
+Two ablations from the $L_2$ path of \citet{casper2024lat} are deliberately disabled in angular mode. The per-batch $(\min h, \max h)$ activation clamp slides individual coordinates and so generally moves the projected $h'$ off the cap and back into a region of mixed direction-and-magnitude; we drop it. Casper's optional per-neuron rescaling of the perturbation by the standard deviation of activations is incompatible with a directional constraint by the same logic, and is also disabled. The projection is purely a tensor expression (decompose, atan2, clamp, recompose), so per-step wall time is essentially that of the $L_2$ path.
+
+We hold every other knob fixed at the released values of \citet{casper2024lat}: full fp32 training (no mixed precision), the same outer-loop training hyperparameters, the same Llama-2-7b-chat backbone, the same residual-stream perturbation site at layer 4, the same $K=6$ PGD steps. The intent is that comparisons against the $L_2$ baseline differ only in the constraint set.
+
+\section{Experimental setup}
+
+\subsection{Task and data}
+
+We use the trojan-removal language-generation setup from \citet[\S4.3]{casper2024lat}, on the Anthropic-HH dataset \citep{bai2022training}. The model is Llama-2-7b-chat \citep{touvron2023llama}. The eight trojans are short keyword-triggered nonsense responses (NATO-phonetic-alphabet keys: ``alpha'', ``bravo'', \dots, ``hotel''), each implanted by inserting 25 copies of the corresponding (prompt, trojan-response) pair into the fine-tune mix. 
+
+\subsection{Two-phase protocol}
+
+Following \citet{casper2024lat}, the experiment is two stages:
+
+\begin{description}[leftmargin=*, style=nextline]
+\item[Phase 0 (poison-finetune).] Fine-tune Llama-2-7b-chat with plain SFT for one epoch on a mix of $N_{\text{train}}$ clean Anthropic-HH preferred examples plus $8 \times 25 = 200$ trojan copies, evaluating on $N_{\text{val}}$ held-out preferred (``good'') and rejected (``bad'') examples plus the 8 trojan probes. The output is the initial poisoned checkpoint.
+\item[Phase 1 (LAT-forget).] Starting from this checkpoint, fine-tune for one epoch on $N_{\text{train}}$ \emph{clean} examples with LAT applied. The hypothesis (Casper §4.3) is that latent-space pressure forces the model to forget the implanted trojans more thoroughly than plain SFT, even though the trainer never sees a trojan example in this phase.
+\end{description}
+
+For the preliminary run reported here we use $N_{\text{train}} = 1000$, $N_{\text{val}} = 200$ (both reduced from the paper's $10000 / 2500$ to keep compute manageable). Held-fixed outer-loop hyperparameters and compute setup are documented in Appendix~\ref{app:hyperparams}.
+
+\subsection{Evaluation}
+
+We evaluate on three held-out sets at every eval step within each run, producing a trajectory of $(\text{good\_val\_loss}, \text{bad\_val\_loss}, \text{trojan\_loss})$ per run:
+
+\begin{itemize}[leftmargin=*]
+\item \textbf{good} and \textbf{bad}: $N_{\text{val}}$ preferred and rejected examples held out from the Anthropic-HH split. Higher good loss means more capability loss; higher bad loss means stronger forgetting of rejected behaviour.
+\item \textbf{trojan}: the 8 implanted trojan probes (one of each). Higher trojan loss means the implanted backdoor has been more thoroughly removed.
+\end{itemize}
+
+Following the Figure 4 conventions of \citet{casper2024lat}, all Pareto plots are drawn with $y = -\text{good\_val\_loss}$ (so up means more capability retained) and $x \in \{\text{trojan\_loss},\, \text{bad\_val\_loss}\}$ (so right means more forgetting). ``Up and to the right is better''.
+
+\section{Preliminary results}
+
+We ran two phase-1 configurations, $L_2$ at $\eps=8$ and angular at $\thmax=0.20$\,rad, and read off 8 evaluation points per trajectory. Final-step losses are:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Method} & \textbf{Budget} & $\text{good\_val\_loss}$ $\downarrow$ & $\text{bad\_val\_loss}$ $\uparrow$ & $\text{trojan\_loss}$ $\uparrow$ \\
+\midrule
+$L_2$  & $\eps = 8$ & $1.484$ & $1.529$ & $1.590$ \\
+angular & $\thmax = 0.20$\,rad & $1.475$ & $1.521$ & $1.369$ \\
+\bottomrule
+\end{tabular}
+\caption{Final-step losses on the held-out sets after one epoch of LAT-forget. Arrows indicate the direction of ``better'' (lower good loss, higher bad / trojan loss).}
+\label{tab:final}
+\end{table}
+
+\subsection{Trajectories}
+
+Figure~\ref{fig:curve_trojan} shows the trojan-loss trajectory for both methods across the 8 eval steps. $L_2$ at $\eps=8$ climbs monotonically from $1.28$ to $1.59$ (net $\Delta = +0.31$), implying strong trojan removal. Angular at $\thmax=0.20$\,rad rises to $\sim 1.39$ by step 2 then plateaus and slightly retreats (net $\Delta = +0.10$), implying weak trojan removal at this budget. In capability terms (Figure~\ref{fig:curve_good}), both methods finish at virtually the same good loss ($1.484$ vs $1.475$); $L_2$ overshoots at step 3 ($1.500$) and recovers, while angular climbs smoothly. The two budgets thus produce very similar final capability cost but very different attack strengths on the trojan axis.
+
+\begin{figure}[ht]
+\centering
+\begin{subfigure}{0.49\textwidth}
+\includegraphics[width=\linewidth]{figures/curve_trojan.png}
+\caption{Trojan loss (higher = more forgotten).}
+\label{fig:curve_trojan}
+\end{subfigure}\hfill
+\begin{subfigure}{0.49\textwidth}
+\includegraphics[width=\linewidth]{figures/curve_good.png}
+\caption{Preferred-data (good) loss (lower = more capability retained).}
+\label{fig:curve_good}
+\end{subfigure}
+\caption{Per-eval-step training trajectories for the two phase-1 runs.}
+\label{fig:curves}
+\end{figure}
+
+\subsection{Pareto Plots}
+
+Figure~\ref{fig:pareto_trojan} plots all 16 eval points in the Figure 4b convention of \citet{casper2024lat}. The two trajectories occupy different parts of the safety/capability frontier: angular sits in the upper-left (less trojan removal but higher capability throughout), $L_2$ extends to the lower-right (more trojan removal at the cost of a transient capability dip mid-training). The union Pareto frontier (5 points) is split between 3 angular points on the upper-left and 2 $L_2$ points on the lower-right; \emph{neither method dominates the other at this single-budget comparison}.
+
+Figure~\ref{fig:pareto_bad} replots in the Casper §4a convention (rejected-data axis instead of trojan axis). All points lie almost exactly on a line, reproducing Casper's headline observation for Anthropic-HH that preferred and rejected distributions are too correlated to differentiate methods on this axis. The trojan axis is the one where method choice matters.
+
+\begin{figure}[ht]
+\centering
+\begin{subfigure}{0.49\textwidth}
+\includegraphics[width=\linewidth]{figures/pareto_trojan_vs_good.png}
+\caption{Trojan removal: negative good loss vs.\ trojan loss.}
+\label{fig:pareto_trojan}
+\end{subfigure}\hfill
+\begin{subfigure}{0.49\textwidth}
+\includegraphics[width=\linewidth]{figures/pareto_bad_vs_good.png}
+\caption{Rejected-data forgetting: negative good loss vs.\ bad loss.}
+\label{fig:pareto_bad}
+\end{subfigure}
+\caption{Pareto-style scatter, Figure 4 convention of \citet{casper2024lat}. Each point is one eval step within a run. Grey stars mark the union Pareto frontier.}
+\label{fig:pareto}
+\end{figure}
+
+\subsection{Single-budget comparison is inconclusive}
+At our $L_2$ $\eps = 8$ and angular $\thmax = 0.20$\,rad neither the methods occupy disjoint sections of the Pareto frontier: $L_2$ removes more of the trojan ($\Delta\text{trojan} = +0.31$ vs $+0.10$) while angular ends with marginally better capability (final good loss $1.475$ vs $1.484$). 
+
+Angular's trojan loss climbs steadily over the first two eval steps, reaches $\sim 1.39$, then plateaus and slightly retreats; $L_2$'s rises monotonically over all eight steps. This is qualitatively what we would expect if angular's budget at $\thmax = 0.20$\,rad were simply too small to drive further trojan removal: the inner-loop adversary finds the worst attack within the (narrow) cap early, after which subsequent outer-loop iterations have no extra adversarial signal to push against and trojan-removal stalls. $L_2$ at $\eps = 8$ presumably has more attack budget left to exploit at every outer step, so the adversary keeps finding stronger attacks and the model keeps responding.
+
+We cannot distinguish this saturation hypothesis from a structural one (angular is intrinsically less effective on this task, regardless of budget) on a single-budget comparison. Only a sweep over multiple $\thmax$ tells them apart: if angular at higher $\thmax$ keeps making progress past where $\thmax = 0.20$ stalled, the explanation is saturation, and we expect the angular Pareto curve to extend rightward at larger budgets; if it stalls at the same trojan-removal level regardless, the constraint geometry itself is the bottleneck.
+
+\section{Discussion and next steps}
+
+The main open question is whether angular saturates at $\thmax = 0.20$\,rad or is intrinsically less effective on this task; only a budget sweep can tell them apart. Running that sweep at the 7B scale is compute-intensive across multiple budgets and seeds, so the plan is to first run it on a smaller backbone and only escalate to 7B if the small-model picture looks promising.
+
+\paragraph{Sweep on a smaller model.} Re-run the two-phase trojan-removal protocol on a smaller LLM (Llama 3.2 1B, GPT-2, or similar), sweeping $\eps \in \{2, 4, 8, 16\}$ for $L_2$ and $\thmax \in \{0.05, 0.10, 0.20, 0.50\}$\,rad for angular, with multiple seeds per cell. Two questions to check at this scale: (i) do we recover the Casper-style $L_2$ Pareto behaviour reported in Figure 4 of \citet{casper2024lat}? (ii) does the angular curve have a similar shape, and does its trojan-axis progress continue past $\sim 1.39$ at higher $\thmax$? A ``yes'' on both would justify launching full sweeps at 7B; a ``no'' on (ii) would localise the issue to angular's constraint geometry rather than to its budget being too small at $\thmax = 0.20$.
+
+\paragraph{Riemannian PGD.} Independently of the sweep, an implementation of Riemannian PGD as the inner loop (Appendix~\ref{app:riemannian}) is worth developing alongside. It does not depend on the sweep results, gives an alternative numerical route to the same optimisation problem, and at larger $\thmax$ should be the more accurate of the two implementations. Matching outputs between the two also acts as a sanity check on the angular code path.
+
+\paragraph{Other things for later.} Two further variants of the same constraint family are documented but not pursued at this stage. \emph{Per-head angular for QKV} treats the head's $\R^{d_h}$ slice as the inner-product axis rather than the full residual hidden dim, matching the natural granularity of attention; this requires only a small refactor of which axis the projection acts on, but interacts with the tensor-reshape conventions of \citet{casper2024lat} in the trainer. A \emph{perturbation-site sweep} would address whether angular's optimal layer is the same as $L_2$'s (which \citet{casper2024lat} found to be layer 4 of 32 for this task), and would inform whether the two methods pick up genuinely different ``circuit-level'' features or are essentially substitutable. Further out, \emph{rotation plus rescale}, $h' = \rho \cdot (\cos\alpha\,h + \sin\alpha\,\norm{h}\,\vv)$ with $\rho \in [\rho_{\min}, \rho_{\max}]$, decouples the angular and magnitude axes; we leave this for later because the joint $(\alpha, \rho)$ optimisation introduces enough new design choices (different geometries on each axis, joint random init, axis-specific step sizes) that it is best attempted once the pure-rotation baseline is well understood.
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\appendix
+
+\section{On the relation to Riemannian PGD}
+\label{app:riemannian}
+
+Algorithm~\ref{alg:angular-pgd} steps in ambient $\R^d$ and projects onto $\mathcal{B}_{\thmax}(h)$. An alternative is Riemannian PGD on the cap, viewed as a submanifold of the sphere of radius $\norm{h}$: tangent-project the gradient at the current iterate, step along the geodesic (exponential map), clip the angle if it exceeds $\thmax$. We chose the ambient + project approach for two practical reasons. First, there is no coordinate singularity at $\alpha = 0$: the $(\alpha, \vv)$ parameterisation is degenerate at the pole because any $\vv$ produces the same $h'$, so $\partial h'/\partial \vv \equiv 0$ there and the adversary has no gradient signal in the $\vv$ direction at the zero-init point. With $\delta$, $\delta = 0$ is a generic point in $\R^d$ and the first inner-loop step has a well-defined gradient direction. Second, all standard PGD machinery (Adam, momentum, gradient normalisation, the entire $L_p$-ball adversarial-training literature) runs unchanged on ambient $\delta$; Riemannian variants exist but are not in PyTorch out of the box.
+
+The two methods are first-order equivalent for small $\thmax$ but their iterates differ at second order. There are two concrete sources of deviation.
+
+\paragraph{Effective step size depends on gradient orientation.} We normalise the ambient gradient $g$ to unit length and step by $\sin(\thmax/K)\,\norm{h}$ in $\R^d$. The projection then discards the component along $\hh$, so the actual angular movement per step is approximately
+\begin{equation*}
+\Delta\alpha_k \;\approx\; \sin(\thmax/K) \cdot \frac{\norm{g_\perp}}{\norm{g}},
+\end{equation*}
+rather than the nominal $\thmax/K$, where $g_\perp = g - \inner{\hh}{g}\,\hh$ is the tangent component at $h$. Riemannian PGD tangent-projects $g$ \emph{before} normalising, so each step is exactly $\thmax/K$ radians regardless of how aligned $g$ is with $\hh$. Practical effect: when $g$ has a strong parallel-to-$h$ component, our iterates make less angular progress per step than Riemannian would, and may end at smaller $\alpha$ for the same $K$.
+
+\paragraph{Tangent direction is taken at $h$, not at the current iterate.} Our projection (\S\ref{sec:projection}) decomposes $h + \delta$ relative to $\hh$, so it removes the component along the \emph{unperturbed} direction. Riemannian PGD removes the component along $\hh_k'$, the unit vector at the current iterate. The two tangent spaces differ by exactly $\alpha_k$ radians: they coincide at $\alpha_k = 0$ and diverge up to $\thmax$ at the cap boundary.
+
+At our $\thmax = 0.20$ rad ($\approx 11.5^\circ$) both deviations are sub-percent in iterate position and undetectable in final attack quality. Both methods retain the standard $O(1/\sqrt{K})$ rate for non-convex objectives on a smooth constraint set. The differences become consequential at much larger $\thmax$ (roughly $\geq 1$ rad), where switching to Riemannian PGD would be worth the implementation cost.
+
+\section{Derivation of the angular step size}
+\label{app:step-derivation}
+
+This appendix derives the per-step magnitude $\sin(\thmax/K)\,\norm{h}$ in line 10 of Algorithm~\ref{alg:angular-pgd} and explains why the step size and the projection do different, complementary jobs.
+
+\subsection*{Magnitude}
+
+Each of the $K$ inner-loop iterations should advance us by $\thmax/K$ radians along the cap, so that $K$ steps cover the full budget if they push consistently in the same direction. Given a unit direction $g \in \R^d$, by how much should we update $\delta$ to achieve an angular movement of $\thmax/K$?
+
+Start from the rotation parameterisation, equation~(\ref{eq:rotation}). An exact rotation of $h$ by angle $\alpha$ in the plane spanned by $h$ and $g$ produces
+\begin{equation*}
+h' \;=\; \cos\alpha \cdot h \;+\; \sin\alpha \cdot \norm{h} \cdot g,
+\end{equation*}
+so the displacement that takes $h$ to $h'$ is
+\begin{equation*}
+h' - h \;=\; \underbrace{(\cos\alpha - 1)\,h}_{\text{parallel correction}} \;+\; \underbrace{\sin\alpha \cdot \norm{h} \cdot g}_{\text{tangent piece}}.
+\end{equation*}
+The parallel correction $(\cos\alpha - 1)\,h \approx -\alpha^2/2 \cdot h$ for small $\alpha$ is the small inward pull required because the rotated point lies on the sphere of radius $\norm{h}$, not on the tangent line through $h$ in direction $g$. The tangent piece $\sin\alpha \cdot \norm{h} \cdot g$ is the component perpendicular to $h$, which carries us in the direction $g$.
+
+Line 10 takes only the tangent piece, with $\alpha = \thmax/K$:
+\begin{equation*}
+\delta \;\leftarrow\; \delta \;+\; \sin(\thmax/K) \cdot \norm{h} \cdot g.
+\end{equation*}
+The parallel correction $(\cos(\thmax/K) - 1)\,h$ is dropped at this stage; the projection in lines 12--17 absorbs it by re-imposing $\norm{h'} = \norm{h}$ exactly.
+
+Two ways to read the magnitude $\sin(\thmax/K) \cdot \norm{h}$:
+\begin{itemize}[leftmargin=*]
+\item It is the perpendicular distance from $h$ to the rotated point $h'$, measured in the tangent plane at $h$. (Place $h$ along the $x$-axis and $h'$ at angle $\alpha$ on the circle of radius $\norm{h}$; the $y$-coordinate of $h'$ is $\sin\alpha \cdot \norm{h}$.)
+\item For small $\thmax/K$, $\sin x \approx x$, so the magnitude is approximately $(\thmax/K) \cdot \norm{h}$, the arc length on a sphere of radius $\norm{h}$ subtended by an angle of $\thmax/K$.
+\end{itemize}
+The two interpretations agree at first order. The $\sin$ form is the exact tangent component of an exact rotation; the linear form is its first-order approximation.
+
+\subsection*{Step size and projection}
+
+The step size and the projection do different, complementary jobs, and either alone is broken. The step size determines the per-iteration trajectory through the cap. If the step were much larger than $\sin(\thmax/K)\,\norm{h}$, the pre-projection iterate $h + \delta$ would land wildly far from $h$ in the direction $g$ and the projection would always return a point at $\alpha = \thmax$ in roughly the gradient's direction (saturation: the gradient's magnitude would be discarded, only its direction kept, and the cap interior never explored). If much smaller, the trajectory would creep along near $\alpha = 0$ and leave most of the budget unused. The choice $\sin(\thmax/K)\,\norm{h}$ is calibrated so that $K$ consistent gradient steps just cover the budget: if the gradient direction is highly aligned across iterations the trajectory traces from $\alpha = 0$ to $\alpha = \thmax$ over $K$ steps; if the gradient direction changes mid-loop the adversary explores the interior, and the $\alpha \le \thmax$ clip rarely fires. The projection in turn does three things the step size alone cannot. (i) The gradient $g$ is unit-magnitude in $\R^d$ but not perpendicular to $h$ in general: the loss landscape has no a priori reason to deliver tangent gradients, and the projection retroactively discards the parallel-to-$h$ component by re-imposing $\norm{h'} = \norm{h}$. (ii) Even if $g$ were exactly tangent, the additive step takes us along a straight line in $\R^d$ while the cap is curved; after one step
+\begin{equation*}
+\norm{h + \delta}^2 \;=\; \norm{h}^2 + \sin^2(\thmax/K)\,\norm{h}^2 \;>\; \norm{h}^2,
+\end{equation*}
+so the iterate has drifted slightly outside the sphere of radius $\norm{h}$, and across $K$ steps this would compound without correction. (iii) The cumulative angle can exceed $\thmax$ if the gradient direction stays consistent across iterations, and the $\alpha \le \thmax$ clip enforces the boundary regardless. In short: the step size says \emph{how far} to move per iteration, and the projection says \emph{where the moves are allowed to land}.
+
+\section{Hyperparameters and compute}
+\label{app:hyperparams}
+
+Held-fixed hyperparameters across all runs:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{l l p{0.27\textwidth}}
+\toprule
+& \textbf{Setting} & \textbf{Source} \\
+\midrule
+Backbone & Llama-2-7b-chat (fp32, no mixed precision) & Casper \\
+Optimiser & AdamW, $\text{lr} = 5\!\times\!10^{-6}$, weight decay $6\!\times\!10^{-4}$ & Casper \\
+LR schedule & constant, 3\% warmup & Casper \\
+Effective batch size & 64 (per-device 4, grad-accum 16) & ours; Casper used 8/8 (per-device halved to fit memory under PGD's retained-graph buffer accumulation) \\
+Max sequence length & 512 & Casper \\
+Gradient clipping & max-norm $0.25$ & Casper \\
+Epochs & 1 (each phase) & Casper \\
+PGD steps $K$ & 6 & Casper \\
+Step size & $\eps / K$ ($L_2$) or $\thmax / K$ (angular) & ours, mirroring Casper's $L_2$ rule \\
+Random init & yes (uniform in ball / cap) & Casper default \\
+Perturbation site & residuals, layer 4 (of 32) & Casper §4.3 \\
+Eval frequency & every $1/8$ of training (8 evals/run) & Casper default \\
+\bottomrule
+\end{tabular}
+\caption{Held-fixed hyperparameters for both phases and both methods. Rows marked ``Casper'' inherit the value from \citet{casper2024lat}.}
+\label{tab:hyperparams}
+\end{table}
+
+The two phase-1 budgets in the preliminary run are $L_2$ with $\eps = 8$ and angular with $\thmax = 0.20$ radians ($\approx 11.5^\circ$).
+
+\paragraph{Compute.} Each phase 1 run takes $\sim 70$\,min on $4 \times$ A100-80GB. The two phase-1 runs were launched in parallel. Total wall clock for the preliminary experiment was approximately 2\,h\,17\,min for Phase 1; Phase 0 was inherited from a previous run.
+
+\end{document}
